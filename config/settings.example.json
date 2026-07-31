@@ -1,13 +1,12 @@
 {
   "_comment": "Copy this file to settings.json and fill in real values. settings.json is gitignored.",
 
-  "anthropic_api_key": "sk-ant-...",
-
   "llm": {
     "provider": "openrouter",
-    "api_key": "sk-...",
+    "api_key": "sk-or-...",
     "writer_model": "openai/gpt-4o",
-    "director_model": "deepseek/deepseek-chat"
+    "director_model": "deepseek/deepseek-chat",
+    "vision_model": "anthropic/claude-sonnet-4.5"
   },
 
   "render": {

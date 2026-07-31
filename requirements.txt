@@ -6,11 +6,10 @@ openpyxl>=3.1
 
 # Already exercised by extract_product_views.py:
 Pillow>=10.0
-anthropic>=0.40
+requests>=2.31          # OpenRouter vision-LLM calls, also used later by render_pipeline.py
 
 # Anticipated by the remaining core pipeline scripts once their TODOs are
 # filled in — uncomment as each script's real implementation lands.
-# requests>=2.31         # cloud render backend calls (render_pipeline.py)
 # python-dotenv>=1.0     # load config/settings.json secrets into the environment
 
 # External (not pip-installable): ffmpeg must be on PATH for finalize_ad.py

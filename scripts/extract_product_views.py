@@ -21,9 +21,10 @@ CLI:
 
 Classification:
     - If <input_path> is a directory (one image per angle already, the
-      common case), a single vision-LLM call (Anthropic API) classifies
-      all images against `names` at once. Images the model can't match
-      to any name are skipped with a CLI warning, not an error.
+      common case), a single vision-LLM call (via OpenRouter's
+      OpenAI-compatible chat completions API) classifies all images
+      against `names` at once. Images the model can't match to any name
+      are skipped with a CLI warning, not an error.
     - If <input_path> is a single file (a multi-view reference sheet),
       it's split into len(names) equal-width vertical strips, left to
       right, matched in order to `names`. This is a naive fallback — see
@@ -38,31 +39,40 @@ import mimetypes
 import tempfile
 from pathlib import Path
 
+import requests
 from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
-VISION_MODEL = "claude-sonnet-4-6"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+DEFAULT_VISION_MODEL = "anthropic/claude-sonnet-4.5"
 
 
-def _load_anthropic_api_key() -> str:
+def _load_openrouter_config() -> tuple[str, str]:
+    """Returns (api_key, vision_model) read from config/settings.json's
+    "llm" block (the same OpenRouter key already used elsewhere in the
+    pipeline). "llm.vision_model" is optional; falls back to
+    DEFAULT_VISION_MODEL if unset.
+    """
     settings_path = REPO_ROOT / "config" / "settings.json"
     if not settings_path.exists():
         raise RuntimeError(
             "config/settings.json not found. Copy config/settings.example.json "
-            "to config/settings.json and fill in 'anthropic_api_key'."
+            "to config/settings.json and fill in 'llm.api_key'."
         )
     settings = json.loads(settings_path.read_text(encoding="utf-8"))
-    api_key = settings.get("anthropic_api_key")
+    llm = settings.get("llm", {})
+    api_key = llm.get("api_key")
     if not api_key:
-        raise RuntimeError("config/settings.json is missing a non-empty 'anthropic_api_key'.")
-    return api_key
+        raise RuntimeError("config/settings.json is missing a non-empty 'llm.api_key'.")
+    vision_model = llm.get("vision_model") or DEFAULT_VISION_MODEL
+    return api_key, vision_model
 
 
-def _encode_image(path: Path) -> tuple[str, str]:
+def _encode_image_data_url(path: Path) -> str:
     media_type = mimetypes.guess_type(path.name)[0] or "image/png"
     data = base64.standard_b64encode(path.read_bytes()).decode("ascii")
-    return media_type, data
+    return f"data:{media_type};base64,{data}"
 
 
 def _classify_views_dir(input_dir: Path, names: list[str]) -> dict[str, Path]:
@@ -76,9 +86,7 @@ def _classify_views_dir(input_dir: Path, names: list[str]) -> dict[str, Path]:
     if not image_paths:
         raise ValueError(f"No image files found in {input_dir}")
 
-    from anthropic import Anthropic
-
-    client = Anthropic(api_key=_load_anthropic_api_key())
+    api_key, vision_model = _load_openrouter_config()
 
     content: list[dict] = [
         {
@@ -95,20 +103,28 @@ def _classify_views_dir(input_dir: Path, names: list[str]) -> dict[str, Path]:
         }
     ]
     for path in image_paths:
-        media_type, data = _encode_image(path)
         content.append({"type": "text", "text": f"Filename: {path.name}"})
         content.append({
-            "type": "image",
-            "source": {"type": "base64", "media_type": media_type, "data": data},
+            "type": "image_url",
+            "image_url": {"url": _encode_image_data_url(path)},
         })
 
     try:
-        response = client.messages.create(
-            model=VISION_MODEL,
-            max_tokens=1024,
-            messages=[{"role": "user", "content": content}],
+        response = requests.post(
+            OPENROUTER_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": vision_model,
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": content}],
+            },
+            timeout=60,
         )
-        raw_text = response.content[0].text
+        response.raise_for_status()
+        raw_text = response.json()["choices"][0]["message"]["content"]
     except Exception as exc:
         print(f"[error] Vision LLM call failed: {exc}")
         raise
