@@ -190,6 +190,8 @@ def classify_views(input_path: Path, names: list[str]) -> dict[str, Path]:
     image to use for that view. `names` is the ordered list of expected
     view labels (e.g. ["front", "side", "back"]).
     """
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input path does not exist: {input_path}")
     if input_path.is_dir():
         return _classify_views_dir(input_path, names)
     return _classify_views_grid(input_path, names)
