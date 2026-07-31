@@ -23,7 +23,7 @@
 #
 # Example:
 #   ./scripts/run_full_pipeline.sh raw/rolex_threeview_src.png rolex \
-#       "面向新中产男性, 强调潜水级专业与低调奢华"
+#       "targets upwardly-mobile professionals, emphasize dive-grade precision and understated luxury"
 
 set -euo pipefail
 
