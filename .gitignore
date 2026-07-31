@@ -1,0 +1,16 @@
+# Generated outputs (large binaries / run artifacts, not source)
+outputs/*.csv
+outputs/*.xlsx
+outputs/*.mp4
+
+# Real secrets/config — copy config/settings.example.json to this and fill in
+config/settings.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# OS
+.DS_Store

@@ -1,0 +1,31 @@
+{
+  "_comment": "Copy this file to settings.json and fill in real values. settings.json is gitignored.",
+
+  "llm": {
+    "provider": "openrouter",
+    "api_key": "sk-...",
+    "writer_model": "openai/gpt-4o",
+    "director_model": "deepseek/deepseek-chat"
+  },
+
+  "render": {
+    "default_animate_backend": "interp",
+    "wan_flf": {
+      "api_key": "",
+      "endpoint": ""
+    },
+    "comfy_url": "http://127.0.0.1:8188"
+  },
+
+  "tts": {
+    "provider": "",
+    "api_key": "",
+    "voice": ""
+  },
+
+  "paths": {
+    "assets_dir": "assets",
+    "workflows_dir": "workflows",
+    "outputs_dir": "outputs"
+  }
+}

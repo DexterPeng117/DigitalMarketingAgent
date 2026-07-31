@@ -1,0 +1,14 @@
+# Python 3.10+
+#
+# Already exercised by ad_tracker.py (export command):
+pandas>=2.0
+openpyxl>=3.1
+
+# Anticipated by the core pipeline scripts once their TODOs are filled in —
+# uncomment as each script's real implementation lands.
+# requests>=2.31         # LLM calls (ad_director.py) / cloud render backend (render_pipeline.py)
+# python-dotenv>=1.0     # load config/settings.json secrets into the environment
+# Pillow>=10.0           # image loading/cropping (extract_product_views.py)
+
+# External (not pip-installable): ffmpeg must be on PATH for finalize_ad.py
+# (concat/mux) and ad_tracker.py (duration probing via ffprobe).
