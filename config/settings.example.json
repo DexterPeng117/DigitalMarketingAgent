@@ -1,6 +1,8 @@
 {
   "_comment": "Copy this file to settings.json and fill in real values. settings.json is gitignored.",
 
+  "anthropic_api_key": "sk-ant-...",
+
   "llm": {
     "provider": "openrouter",
     "api_key": "sk-...",
