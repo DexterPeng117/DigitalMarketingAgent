@@ -280,12 +280,26 @@ def _wan_video_poll(api_key: str, polling_url: str) -> dict:
 
 
 def _wan_video_download(api_key: str, result: dict, out_path: Path) -> None:
+    """Download the finished clip and strip its audio track.
+
+    Verified against a real generation: even with generate_audio=false
+    in the submit payload, the returned mp4 still carried an AAC audio
+    stream. This backend's whole job is a *silent* clip (finalize_ad.py
+    adds narration/music later), so the track is stripped unconditionally
+    here rather than trusted to already be silent/absent.
+    """
     urls = result.get("unsigned_urls") or []
     if not urls:
         raise RuntimeError(f"OpenRouter video job completed but returned no unsigned_urls: {result}")
     response = requests.get(urls[0], headers={"Authorization": f"Bearer {api_key}"}, timeout=120)
     response.raise_for_status()
-    out_path.write_bytes(response.content)
+
+    raw_path = out_path.with_name(out_path.stem + ".raw" + out_path.suffix)
+    raw_path.write_bytes(response.content)
+    try:
+        _run_ffmpeg(["ffmpeg", "-y", "-i", str(raw_path), "-c:v", "copy", "-an", str(out_path)])
+    finally:
+        raw_path.unlink(missing_ok=True)
 
 
 def render_wan_flf(spec: dict, story_reel_dir: Path, out_path: Path) -> Path:

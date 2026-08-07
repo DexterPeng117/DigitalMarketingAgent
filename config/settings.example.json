@@ -14,9 +14,10 @@
   },
 
   "tts": {
-    "provider": "",
-    "api_key": "",
-    "voice": ""
+    "provider": "openrouter",
+    "model": "fish-audio/s2.1-pro-free:free",
+    "voice": "",
+    "response_format": "mp3"
   },
 
   "paths": {

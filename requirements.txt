@@ -4,15 +4,14 @@
 pandas>=2.0
 openpyxl>=3.1
 
-# Already exercised by extract_product_views.py (OpenRouter vision calls)
-# and render_pipeline.py (Pillow for interp-backend crossfade frames,
-# requests for the wan_flf REST skeleton):
+# Already exercised by extract_product_views.py (OpenRouter vision calls),
+# render_pipeline.py (Pillow for interp-backend crossfade frames, requests
+# for the wan_flf backend's OpenRouter Video API calls), and finalize_ad.py
+# (requests for OpenRouter's TTS endpoint):
 Pillow>=10.0
 requests>=2.31
 
-# Anticipated by the remaining core pipeline scripts once their TODOs are
-# filled in — uncomment as each script's real implementation lands.
-# python-dotenv>=1.0     # load config/settings.json secrets into the environment
+# python-dotenv>=1.0     # load config/settings.json secrets into the environment (unused so far)
 
 # External (not pip-installable): ffmpeg/ffprobe must be on PATH for
 # render_pipeline.py (frame encoding, concat, xfade), finalize_ad.py
