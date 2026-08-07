@@ -11,10 +11,6 @@
 
   "render": {
     "default_animate_backend": "interp",
-    "wan_flf": {
-      "api_key": "",
-      "endpoint": ""
-    },
     "comfy_url": "http://127.0.0.1:8188"
   },
 

@@ -25,9 +25,13 @@ Backend selection:
                     NotImplementedError here (see their own docstrings:
                     they require a live ComfyUI instance that this repo
                     has no access to) and calling them would just crash.
-      - "wan_flf" — paid cloud AI render (first/last-frame video model).
-                    A generic REST call skeleton; see render_wan_flf's
-                    docstring — untested, no budget for a live call yet.
+      - "wan_flf" — Wan 2.2 first-last-frame-to-video, run locally
+                    through a ComfyUI instance (Apache-2.0, Alibaba,
+                    commercially usable) — see render_wan_flf's
+                    docstring. No paid API; cost is just local/rented
+                    GPU time. Untested end-to-end in this environment
+                    (no GPU/ComfyUI/model weights here) — see that
+                    docstring for exactly what's been verified.
 
     Per-shot clips are then concatenated according to spec["assemble"]:
       - "cut"   — straight concatenation (ffmpeg concat demuxer).
@@ -49,8 +53,11 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
+import uuid
 from pathlib import Path
 
+import requests
 from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -59,6 +66,25 @@ DEFAULT_WIDTH = 1080
 DEFAULT_HEIGHT = 1920
 DEFAULT_SHOT_DURATION_S = 3.0
 DEFAULT_XFADE_DURATION_S = 0.5
+
+# lib/story_reel/comfy_workflows/wan_flf2v.json is the API-format node graph
+# for Wan 2.2 FLF2V (the 4-step LoRA-accelerated variant of the official
+# Comfy-Org "video_wan2_2_14B_flf2v" template — see render_wan_flf's
+# docstring for provenance/model list). These are the node ids inside that
+# JSON that render_wan_flf patches per shot.
+COMFY_WORKFLOW_PATH = REPO_ROOT / "lib" / "story_reel" / "comfy_workflows" / "wan_flf2v.json"
+WAN_FLF2V_POSITIVE_NODE = "6"
+WAN_FLF2V_NEGATIVE_NODE = "7"
+WAN_FLF2V_START_IMAGE_NODE = "68"
+WAN_FLF2V_END_IMAGE_NODE = "62"
+WAN_FLF2V_FLF_NODE = "67"
+WAN_FLF2V_SEED_NODE = "57"
+WAN_FLF2V_VIDEO_NODE = "60"
+
+COMFY_HEALTHCHECK_TIMEOUT_S = 5
+COMFY_SUBMIT_TIMEOUT_S = 30
+COMFY_POLL_INTERVAL_S = 5
+COMFY_POLL_TIMEOUT_S = 900
 
 
 def load_spec(spec_path: Path) -> dict:
@@ -197,47 +223,151 @@ def render_interp(spec: dict, story_reel_dir: Path, out_path: Path) -> Path:
     return out_path
 
 
-def _wan_flf_config() -> tuple[str, str]:
+def _comfy_url() -> str:
     settings_path = REPO_ROOT / "config" / "settings.json"
     if not settings_path.exists():
         raise RuntimeError(
             "config/settings.json not found. Copy config/settings.example.json "
-            "to config/settings.json and fill in 'render.wan_flf.api_key'/'endpoint'."
+            "to config/settings.json (render.comfy_url defaults to http://127.0.0.1:8188)."
         )
     settings = json.loads(settings_path.read_text(encoding="utf-8"))
-    wan_flf = settings.get("render", {}).get("wan_flf", {})
-    api_key = wan_flf.get("api_key")
-    endpoint = wan_flf.get("endpoint")
-    if not api_key or not endpoint:
+    comfy_url = settings.get("render", {}).get("comfy_url")
+    if not comfy_url:
+        raise RuntimeError("config/settings.json is missing a non-empty 'render.comfy_url'.")
+    return comfy_url.rstrip("/")
+
+
+def _check_comfy_reachable(comfy_url: str) -> None:
+    """Fail fast (bounded by COMFY_HEALTHCHECK_TIMEOUT_S) instead of
+    hanging on ComfyUI's default request timeout if it's offline."""
+    try:
+        response = requests.get(f"{comfy_url}/system_stats", timeout=COMFY_HEALTHCHECK_TIMEOUT_S)
+        response.raise_for_status()
+    except Exception as exc:
         raise RuntimeError(
-            "wan_flf backend requires render.wan_flf.api_key and render.wan_flf.endpoint "
-            "to be set in config/settings.json."
+            f"ComfyUI not reachable at {comfy_url}; make sure it's running locally "
+            f"with the Wan 2.2 models installed."
+        ) from exc
+
+
+def _comfy_upload_image(comfy_url: str, path: Path) -> str:
+    with path.open("rb") as f:
+        response = requests.post(
+            f"{comfy_url}/upload/image",
+            files={"image": (path.name, f, "image/png")},
+            data={"type": "input", "overwrite": "true"},
+            timeout=60,
         )
-    return api_key, endpoint
+    response.raise_for_status()
+    return response.json()["name"]
 
 
-def _wan_flf_image_payload(path: Path) -> str:
-    import base64
-    import mimetypes
-    media_type = mimetypes.guess_type(path.name)[0] or "image/png"
-    data = base64.standard_b64encode(path.read_bytes()).decode("ascii")
-    return f"data:{media_type};base64,{data}"
+def _comfy_submit(comfy_url: str, workflow: dict) -> str:
+    response = requests.post(
+        f"{comfy_url}/prompt",
+        json={"prompt": workflow, "client_id": str(uuid.uuid4())},
+        timeout=COMFY_SUBMIT_TIMEOUT_S,
+    )
+    response.raise_for_status()
+    return response.json()["prompt_id"]
+
+
+def _comfy_wait_for_result(comfy_url: str, prompt_id: str) -> dict:
+    """Poll /history/{prompt_id} until ComfyUI reports this prompt done,
+    then return its "outputs" dict.
+
+    Known caveat (unverified here, flagging for whoever runs this for
+    real): ComfyUI's /history reporting for SaveVideo specifically has
+    had reliability issues in some versions — a render can finish and
+    the file can exist in ComfyUI's output/ folder while /history never
+    shows it. If this raises TimeoutError despite ComfyUI's own
+    console/log clearly showing the prompt finished, check its output
+    folder directly before assuming the call itself is broken.
+    """
+    deadline = time.monotonic() + COMFY_POLL_TIMEOUT_S
+    while time.monotonic() < deadline:
+        response = requests.get(f"{comfy_url}/history/{prompt_id}", timeout=30)
+        response.raise_for_status()
+        history = response.json()
+        entry = history.get(prompt_id)
+        if entry is not None:
+            status = entry.get("status", {})
+            if status.get("status_str") == "error":
+                raise RuntimeError(f"ComfyUI reported an error for prompt {prompt_id}: {status}")
+            if status.get("completed") or status.get("status_str") == "success":
+                return entry.get("outputs", {})
+        time.sleep(COMFY_POLL_INTERVAL_S)
+    raise TimeoutError(f"Timed out after {COMFY_POLL_TIMEOUT_S}s waiting for ComfyUI prompt {prompt_id}")
+
+
+def _comfy_find_video_file(outputs: dict) -> dict:
+    """outputs is node_id -> {field_name: value, ...}; scan every
+    list-valued field for a dict with a "filename" key, since the exact
+    field name SaveVideo's output lands under has moved between ComfyUI
+    versions (images/gifs/videos) — see _comfy_wait_for_result's caveat.
+    """
+    for node_output in outputs.values():
+        for value in node_output.values():
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict) and "filename" in item:
+                        return item
+    raise RuntimeError(f"No output file found in ComfyUI history outputs: {outputs}")
+
+
+def _comfy_download(comfy_url: str, file_ref: dict, out_path: Path) -> None:
+    params = {
+        "filename": file_ref["filename"],
+        "subfolder": file_ref.get("subfolder", ""),
+        "type": file_ref.get("type", "output"),
+    }
+    response = requests.get(f"{comfy_url}/view", params=params, timeout=120)
+    response.raise_for_status()
+    out_path.write_bytes(response.content)
 
 
 def render_wan_flf(spec: dict, story_reel_dir: Path, out_path: Path) -> Path:
-    """Render all shots using the paid cloud AI backend (wan_flf).
+    """Render all shots using Wan 2.2 FLF2V (first-last-frame-to-video)
+    through a locally-running ComfyUI instance — Apache-2.0, Alibaba,
+    commercially usable, no paid API; cost is just local/rented GPU time.
 
-    This is an HTTP call skeleton, not a verified integration: no budget
-    has been available to test against a real wan_flf endpoint, so the
-    request/response shape below (base64 start/end frame images in,
-    raw mp4 bytes back) is a placeholder to be corrected against the
-    real API docs once we have one to test against. What IS verified:
-    it fails fast with a clear error if render.wan_flf.api_key/endpoint
-    aren't configured, rather than partway through a shot.
+    Drives lib/story_reel/comfy_workflows/wan_flf2v.json, the API-format
+    node graph for the 4-step LoRA-accelerated variant of the official
+    Comfy-Org "video_wan2_2_14B_flf2v" template (~70-110s/shot on an
+    RTX 4090-class GPU, vs 500s+ without the LoRA — chosen here since the
+    whole point of this backend is near-zero cost per shot, and less GPU
+    time is less cost). Every node in it is comfy-core (no custom node
+    packs); requires these model files under ComfyUI/models/:
+      diffusion_models/  wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors
+                          wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors
+      loras/              wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors
+                          wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors
+      text_encoders/      umt5_xxl_fp8_e4m3fn_scaled.safetensors
+      vae/                wan_2.1_vae.safetensors
+    (all from huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged, per
+    docs.comfy.org/tutorials/video/wan/wan2_2).
+
+    Per shot: uploads the start/end view images to ComfyUI (/upload/image),
+    patches a copy of the workflow template with this shot's prompt/
+    negative_prompt/width/height/length/seed, submits it (/prompt), polls
+    for completion (/history), and downloads the resulting clip (/view).
+
+    Fails fast with a clear error if ComfyUI isn't reachable at
+    config/settings.json's render.comfy_url — checked once up front via
+    /system_stats, bounded by COMFY_HEALTHCHECK_TIMEOUT_S — rather than
+    hanging on a connection timeout or failing partway through a shot.
+
+    What's actually been verified without a GPU/ComfyUI/model weights
+    available in this environment: the unreachable-ComfyUI fail-fast path
+    (tested against a real connection-refused address), and that the
+    workflow JSON's node graph faithfully reproduces the official
+    template's wiring (traced node-by-node from its links, not guessed).
+    The live HTTP round-trip (submit/poll/view) against a real ComfyUI
+    instance is NOT verified — see this repo's notes on what Ricard's
+    GPU box needs before that's possible.
     """
-    api_key, endpoint = _wan_flf_config()
-
-    import requests
+    comfy_url = _comfy_url()
+    _check_comfy_reachable(comfy_url)
 
     fps = int(spec.get("fps", DEFAULT_FPS))
     width = int(spec.get("width", DEFAULT_WIDTH))
@@ -249,6 +379,8 @@ def render_wan_flf(spec: dict, story_reel_dir: Path, out_path: Path) -> Path:
     if not view_images:
         raise ValueError("spec has no product.views to render from")
 
+    template = json.loads(COMFY_WORKFLOW_PATH.read_text(encoding="utf-8"))
+
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -257,30 +389,35 @@ def render_wan_flf(spec: dict, story_reel_dir: Path, out_path: Path) -> Path:
         clips = []
         for i, shot in enumerate(shots):
             start_path, end_path = _shot_view_paths(shot, view_images, i)
-            payload = {
-                "start_image": _wan_flf_image_payload(start_path),
-                "end_image": _wan_flf_image_payload(end_path),
-                "prompt": shot.get("prompt", ""),
-                "negative_prompt": shot.get("negative_prompt", ""),
-                "duration_s": shot.get("duration_s", DEFAULT_SHOT_DURATION_S),
-                "fps": fps,
-                "width": width,
-                "height": height,
-                "seed": shot.get("seed"),
-            }
             try:
-                response = requests.post(
-                    endpoint,
-                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                    json=payload,
-                    timeout=300,
-                )
-                response.raise_for_status()
+                start_name = _comfy_upload_image(comfy_url, start_path)
+                end_name = _comfy_upload_image(comfy_url, end_path)
+
+                workflow = json.loads(json.dumps(template))  # deep copy
+                workflow[WAN_FLF2V_START_IMAGE_NODE]["inputs"]["image"] = start_name
+                workflow[WAN_FLF2V_END_IMAGE_NODE]["inputs"]["image"] = end_name
+                workflow[WAN_FLF2V_POSITIVE_NODE]["inputs"]["text"] = shot.get("prompt", "")
+                workflow[WAN_FLF2V_NEGATIVE_NODE]["inputs"]["text"] = shot.get("negative_prompt", "")
+                workflow[WAN_FLF2V_FLF_NODE]["inputs"]["width"] = width
+                workflow[WAN_FLF2V_FLF_NODE]["inputs"]["height"] = height
+                duration_s = float(shot.get("duration_s") or DEFAULT_SHOT_DURATION_S)
+                # WanFirstLastFrameToVideo's "length" is output frame count + 1
+                # (see the official template: length=81 @ fps=16 -> 80 output
+                # frames -> 5s; the +1 covers the boundary first-frame latent).
+                workflow[WAN_FLF2V_FLF_NODE]["inputs"]["length"] = max(round(duration_s * fps), 1) + 1
+                seed = shot.get("seed")
+                workflow[WAN_FLF2V_SEED_NODE]["inputs"]["noise_seed"] = int(seed) if seed is not None else 0
+                workflow[WAN_FLF2V_VIDEO_NODE]["inputs"]["fps"] = fps
+
+                prompt_id = _comfy_submit(comfy_url, workflow)
+                outputs = _comfy_wait_for_result(comfy_url, prompt_id)
+                file_ref = _comfy_find_video_file(outputs)
             except Exception as exc:
                 print(f"[error] wan_flf render call failed for shot #{i}: {exc}")
                 raise
+
             clip_path = tmp_dir / f"shot_{i:03d}.mp4"
-            clip_path.write_bytes(response.content)
+            _comfy_download(comfy_url, file_ref, clip_path)
             clips.append(clip_path)
 
         _concat_shots(clips, spec, story_reel_dir, out_path)
