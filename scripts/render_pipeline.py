@@ -25,20 +25,18 @@ Backend selection:
                     NotImplementedError here (see their own docstrings:
                     they require a live ComfyUI instance that this repo
                     has no access to) and calling them would just crash.
-      - "wan_flf" — Wan 2.2 first-last-frame-to-video, run locally
-                    through a ComfyUI instance (Apache-2.0, Alibaba,
-                    commercially usable) — see render_wan_flf's
-                    docstring. No paid API; cost is just local/rented
-                    GPU time. Untested end-to-end in this environment
-                    (no GPU/ComfyUI/model weights here) — see that
-                    docstring for exactly what's been verified.
+      - "wan_flf" — Wan 2.2 (alibaba/wan-2.7) first-last-frame-to-video
+                    via OpenRouter's video generation API
+                    (openrouter.ai/api/v1/videos) — see render_wan_flf's
+                    docstring. Same OpenRouter account/key already used
+                    by extract_product_views.py and ad_director.py; no
+                    GPU, no ComfyUI, no separate account.
 
     Per-shot clips are then concatenated according to spec["assemble"]:
       - "cut"   — straight concatenation (ffmpeg concat demuxer).
       - "xfade" — crossfade between consecutive clips, implemented in
                   lib/story_reel/sr_concat.py's concat_xfade() with
-                  ffmpeg's xfade filter. That function is pure ffmpeg
-                  (no ComfyUI dependency), unlike the three stubs above.
+                  ffmpeg's xfade filter.
 
 CLI:
     python scripts/render_pipeline.py <spec_path> \
@@ -54,7 +52,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import uuid
 from pathlib import Path
 
 import requests
@@ -67,24 +64,12 @@ DEFAULT_HEIGHT = 1920
 DEFAULT_SHOT_DURATION_S = 3.0
 DEFAULT_XFADE_DURATION_S = 0.5
 
-# lib/story_reel/comfy_workflows/wan_flf2v.json is the API-format node graph
-# for Wan 2.2 FLF2V (the 4-step LoRA-accelerated variant of the official
-# Comfy-Org "video_wan2_2_14B_flf2v" template — see render_wan_flf's
-# docstring for provenance/model list). These are the node ids inside that
-# JSON that render_wan_flf patches per shot.
-COMFY_WORKFLOW_PATH = REPO_ROOT / "lib" / "story_reel" / "comfy_workflows" / "wan_flf2v.json"
-WAN_FLF2V_POSITIVE_NODE = "6"
-WAN_FLF2V_NEGATIVE_NODE = "7"
-WAN_FLF2V_START_IMAGE_NODE = "68"
-WAN_FLF2V_END_IMAGE_NODE = "62"
-WAN_FLF2V_FLF_NODE = "67"
-WAN_FLF2V_SEED_NODE = "57"
-WAN_FLF2V_VIDEO_NODE = "60"
-
-COMFY_HEALTHCHECK_TIMEOUT_S = 5
-COMFY_SUBMIT_TIMEOUT_S = 30
-COMFY_POLL_INTERVAL_S = 5
-COMFY_POLL_TIMEOUT_S = 900
+# OpenRouter's video generation API (openrouter.ai/api/v1/videos) — see
+# render_wan_flf's docstring for the documentation this is based on.
+OPENROUTER_VIDEO_URL = "https://openrouter.ai/api/v1/videos"
+DEFAULT_WAN_VIDEO_MODEL = "alibaba/wan-2.7"
+WAN_VIDEO_POLL_INTERVAL_S = 20
+WAN_VIDEO_POLL_TIMEOUT_S = 900
 
 
 def load_spec(spec_path: Path) -> dict:
@@ -223,153 +208,124 @@ def render_interp(spec: dict, story_reel_dir: Path, out_path: Path) -> Path:
     return out_path
 
 
-def _comfy_url() -> str:
+def _load_openrouter_api_key() -> str:
+    """Same key/config used by extract_product_views.py and ad_director.py
+    (config/settings.json's "llm.api_key") — this backend is just another
+    OpenRouter call, not a separate account."""
     settings_path = REPO_ROOT / "config" / "settings.json"
     if not settings_path.exists():
         raise RuntimeError(
             "config/settings.json not found. Copy config/settings.example.json "
-            "to config/settings.json (render.comfy_url defaults to http://127.0.0.1:8188)."
+            "to config/settings.json and fill in 'llm.api_key'."
         )
     settings = json.loads(settings_path.read_text(encoding="utf-8"))
-    comfy_url = settings.get("render", {}).get("comfy_url")
-    if not comfy_url:
-        raise RuntimeError("config/settings.json is missing a non-empty 'render.comfy_url'.")
-    return comfy_url.rstrip("/")
+    api_key = settings.get("llm", {}).get("api_key")
+    if not api_key:
+        raise RuntimeError("config/settings.json is missing a non-empty 'llm.api_key'.")
+    return api_key
 
 
-def _check_comfy_reachable(comfy_url: str) -> None:
-    """Fail fast (bounded by COMFY_HEALTHCHECK_TIMEOUT_S) instead of
-    hanging on ComfyUI's default request timeout if it's offline."""
-    try:
-        response = requests.get(f"{comfy_url}/system_stats", timeout=COMFY_HEALTHCHECK_TIMEOUT_S)
-        response.raise_for_status()
-    except Exception as exc:
-        raise RuntimeError(
-            f"ComfyUI not reachable at {comfy_url}; make sure it's running locally "
-            f"with the Wan 2.2 models installed."
-        ) from exc
+def _wan_video_image_url(path: Path) -> str:
+    import base64
+    import mimetypes
+    media_type = mimetypes.guess_type(path.name)[0] or "image/png"
+    data = base64.standard_b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{media_type};base64,{data}"
 
 
-def _comfy_upload_image(comfy_url: str, path: Path) -> str:
-    with path.open("rb") as f:
-        response = requests.post(
-            f"{comfy_url}/upload/image",
-            files={"image": (path.name, f, "image/png")},
-            data={"type": "input", "overwrite": "true"},
-            timeout=60,
-        )
-    response.raise_for_status()
-    return response.json()["name"]
-
-
-def _comfy_submit(comfy_url: str, workflow: dict) -> str:
-    response = requests.post(
-        f"{comfy_url}/prompt",
-        json={"prompt": workflow, "client_id": str(uuid.uuid4())},
-        timeout=COMFY_SUBMIT_TIMEOUT_S,
-    )
-    response.raise_for_status()
-    return response.json()["prompt_id"]
-
-
-def _comfy_wait_for_result(comfy_url: str, prompt_id: str) -> dict:
-    """Poll /history/{prompt_id} until ComfyUI reports this prompt done,
-    then return its "outputs" dict.
-
-    Known caveat (unverified here, flagging for whoever runs this for
-    real): ComfyUI's /history reporting for SaveVideo specifically has
-    had reliability issues in some versions — a render can finish and
-    the file can exist in ComfyUI's output/ folder while /history never
-    shows it. If this raises TimeoutError despite ComfyUI's own
-    console/log clearly showing the prompt finished, check its output
-    folder directly before assuming the call itself is broken.
-    """
-    deadline = time.monotonic() + COMFY_POLL_TIMEOUT_S
-    while time.monotonic() < deadline:
-        response = requests.get(f"{comfy_url}/history/{prompt_id}", timeout=30)
-        response.raise_for_status()
-        history = response.json()
-        entry = history.get(prompt_id)
-        if entry is not None:
-            status = entry.get("status", {})
-            if status.get("status_str") == "error":
-                raise RuntimeError(f"ComfyUI reported an error for prompt {prompt_id}: {status}")
-            if status.get("completed") or status.get("status_str") == "success":
-                return entry.get("outputs", {})
-        time.sleep(COMFY_POLL_INTERVAL_S)
-    raise TimeoutError(f"Timed out after {COMFY_POLL_TIMEOUT_S}s waiting for ComfyUI prompt {prompt_id}")
-
-
-def _comfy_find_video_file(outputs: dict) -> dict:
-    """outputs is node_id -> {field_name: value, ...}; scan every
-    list-valued field for a dict with a "filename" key, since the exact
-    field name SaveVideo's output lands under has moved between ComfyUI
-    versions (images/gifs/videos) — see _comfy_wait_for_result's caveat.
-    """
-    for node_output in outputs.values():
-        for value in node_output.values():
-            if isinstance(value, list):
-                for item in value:
-                    if isinstance(item, dict) and "filename" in item:
-                        return item
-    raise RuntimeError(f"No output file found in ComfyUI history outputs: {outputs}")
-
-
-def _comfy_download(comfy_url: str, file_ref: dict, out_path: Path) -> None:
-    params = {
-        "filename": file_ref["filename"],
-        "subfolder": file_ref.get("subfolder", ""),
-        "type": file_ref.get("type", "output"),
+def _wan_video_submit(api_key: str, shot: dict, start_path: Path, end_path: Path,
+                       width: int, height: int) -> dict:
+    duration_s = float(shot.get("duration_s") or DEFAULT_SHOT_DURATION_S)
+    payload = {
+        "model": DEFAULT_WAN_VIDEO_MODEL,
+        "prompt": shot.get("prompt", ""),
+        "duration": round(duration_s),
+        "size": f"{width}x{height}",
+        "generate_audio": False,
+        "frame_images": [
+            {"type": "image_url", "image_url": {"url": _wan_video_image_url(start_path)}, "frame_type": "first_frame"},
+            {"type": "image_url", "image_url": {"url": _wan_video_image_url(end_path)}, "frame_type": "last_frame"},
+        ],
     }
-    response = requests.get(f"{comfy_url}/view", params=params, timeout=120)
+    seed = shot.get("seed")
+    if seed is not None:
+        payload["seed"] = int(seed)
+
+    response = requests.post(
+        OPENROUTER_VIDEO_URL,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=60,
+    )
+    if not response.ok:
+        raise RuntimeError(f"OpenRouter video submission failed ({response.status_code}): {response.text}")
+    return response.json()
+
+
+def _wan_video_poll(api_key: str, polling_url: str) -> dict:
+    """Poll until the job reaches a terminal state, bounded by
+    WAN_VIDEO_POLL_TIMEOUT_S so this can never hang indefinitely."""
+    deadline = time.monotonic() + WAN_VIDEO_POLL_TIMEOUT_S
+    while time.monotonic() < deadline:
+        response = requests.get(polling_url, headers={"Authorization": f"Bearer {api_key}"}, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        status = data.get("status")
+        if status == "completed":
+            return data
+        if status in ("failed", "cancelled", "expired"):
+            raise RuntimeError(f"OpenRouter video job {data.get('id')} ended with status={status!r}: {data.get('error')}")
+        time.sleep(WAN_VIDEO_POLL_INTERVAL_S)
+    raise TimeoutError(f"Timed out after {WAN_VIDEO_POLL_TIMEOUT_S}s waiting for OpenRouter video job at {polling_url}")
+
+
+def _wan_video_download(api_key: str, result: dict, out_path: Path) -> None:
+    urls = result.get("unsigned_urls") or []
+    if not urls:
+        raise RuntimeError(f"OpenRouter video job completed but returned no unsigned_urls: {result}")
+    response = requests.get(urls[0], headers={"Authorization": f"Bearer {api_key}"}, timeout=120)
     response.raise_for_status()
     out_path.write_bytes(response.content)
 
 
 def render_wan_flf(spec: dict, story_reel_dir: Path, out_path: Path) -> Path:
-    """Render all shots using Wan 2.2 FLF2V (first-last-frame-to-video)
-    through a locally-running ComfyUI instance — Apache-2.0, Alibaba,
-    commercially usable, no paid API; cost is just local/rented GPU time.
+    """Render all shots using Wan 2.2 (alibaba/wan-2.7) first-last-frame-
+    to-video through OpenRouter's video generation API — no GPU, no
+    ComfyUI, no separate account: same config/settings.json "llm.api_key"
+    already used by extract_product_views.py/ad_director.py. Pricing is
+    $0.10/second (openrouter.ai/alibaba/wan-2.7).
 
-    Drives lib/story_reel/comfy_workflows/wan_flf2v.json, the API-format
-    node graph for the 4-step LoRA-accelerated variant of the official
-    Comfy-Org "video_wan2_2_14B_flf2v" template (~70-110s/shot on an
-    RTX 4090-class GPU, vs 500s+ without the LoRA — chosen here since the
-    whole point of this backend is near-zero cost per shot, and less GPU
-    time is less cost). Every node in it is comfy-core (no custom node
-    packs); requires these model files under ComfyUI/models/:
-      diffusion_models/  wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors
-                          wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors
-      loras/              wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors
-                          wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors
-      text_encoders/      umt5_xxl_fp8_e4m3fn_scaled.safetensors
-      vae/                wan_2.1_vae.safetensors
-    (all from huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged, per
-    docs.comfy.org/tutorials/video/wan/wan2_2).
+    Endpoints/fields below are from openrouter.ai/docs/guides/overview/
+    multimodal/video-generation, github.com/OpenRouterTeam/skills'
+    openrouter-video SKILL.md, and openrouter.ai/docs/cookbook/
+    video-generation/image-to-video — not guessed:
+      POST https://openrouter.ai/api/v1/videos
+        {"model", "prompt", "duration" (int, must match the model's
+         supported_durations — not published anywhere we could find, so
+         this just passes round(shot["duration_s"]) and lets OpenRouter's
+         own validation error surface if it's unsupported), "size"
+         ("WxH"), "generate_audio" (false here — this backend renders a
+         silent clip; finalize_ad.py adds narration/music later), "seed",
+         "frame_images": [{"type": "image_url", "image_url": {"url": ...},
+         "frame_type": "first_frame"|"last_frame"}]}
+        -> 202 {"id", "polling_url", "status": "pending"}
+      GET {polling_url}  (Bearer auth)
+        -> {"status": "pending"|"in_progress"|"completed"|"failed"|
+            "cancelled"|"expired", "unsigned_urls": [...] (on completion),
+            "error": "..." (on failure), "usage": {...}}
+      GET {unsigned_urls[0]}  (Bearer auth) -> the video file's bytes.
 
-    Per shot: uploads the start/end view images to ComfyUI (/upload/image),
-    patches a copy of the workflow template with this shot's prompt/
-    negative_prompt/width/height/length/seed, submits it (/prompt), polls
-    for completion (/history), and downloads the resulting clip (/view).
+    shot["negative_prompt"] is intentionally NOT sent: none of the above
+    sources document a negative_prompt (or equivalent) field on this API
+    — unlike OpenRouter's chat/vision endpoints, which do — so rather
+    than guess an undocumented field name, it's dropped for this backend.
 
-    Fails fast with a clear error if ComfyUI isn't reachable at
-    config/settings.json's render.comfy_url — checked once up front via
-    /system_stats, bounded by COMFY_HEALTHCHECK_TIMEOUT_S — rather than
-    hanging on a connection timeout or failing partway through a shot.
-
-    What's actually been verified without a GPU/ComfyUI/model weights
-    available in this environment: the unreachable-ComfyUI fail-fast path
-    (tested against a real connection-refused address), and that the
-    workflow JSON's node graph faithfully reproduces the official
-    template's wiring (traced node-by-node from its links, not guessed).
-    The live HTTP round-trip (submit/poll/view) against a real ComfyUI
-    instance is NOT verified — see this repo's notes on what Ricard's
-    GPU box needs before that's possible.
+    Polling is bounded by WAN_VIDEO_POLL_TIMEOUT_S (15 min) so a stuck
+    job can't hang the pipeline forever; a missing/empty llm.api_key
+    raises immediately, before any shot is touched.
     """
-    comfy_url = _comfy_url()
-    _check_comfy_reachable(comfy_url)
+    api_key = _load_openrouter_api_key()
 
-    fps = int(spec.get("fps", DEFAULT_FPS))
     width = int(spec.get("width", DEFAULT_WIDTH))
     height = int(spec.get("height", DEFAULT_HEIGHT))
     shots = spec.get("shots")
@@ -378,8 +334,6 @@ def render_wan_flf(spec: dict, story_reel_dir: Path, out_path: Path) -> Path:
     view_images = _view_images(spec)
     if not view_images:
         raise ValueError("spec has no product.views to render from")
-
-    template = json.loads(COMFY_WORKFLOW_PATH.read_text(encoding="utf-8"))
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -390,34 +344,15 @@ def render_wan_flf(spec: dict, story_reel_dir: Path, out_path: Path) -> Path:
         for i, shot in enumerate(shots):
             start_path, end_path = _shot_view_paths(shot, view_images, i)
             try:
-                start_name = _comfy_upload_image(comfy_url, start_path)
-                end_name = _comfy_upload_image(comfy_url, end_path)
-
-                workflow = json.loads(json.dumps(template))  # deep copy
-                workflow[WAN_FLF2V_START_IMAGE_NODE]["inputs"]["image"] = start_name
-                workflow[WAN_FLF2V_END_IMAGE_NODE]["inputs"]["image"] = end_name
-                workflow[WAN_FLF2V_POSITIVE_NODE]["inputs"]["text"] = shot.get("prompt", "")
-                workflow[WAN_FLF2V_NEGATIVE_NODE]["inputs"]["text"] = shot.get("negative_prompt", "")
-                workflow[WAN_FLF2V_FLF_NODE]["inputs"]["width"] = width
-                workflow[WAN_FLF2V_FLF_NODE]["inputs"]["height"] = height
-                duration_s = float(shot.get("duration_s") or DEFAULT_SHOT_DURATION_S)
-                # WanFirstLastFrameToVideo's "length" is output frame count + 1
-                # (see the official template: length=81 @ fps=16 -> 80 output
-                # frames -> 5s; the +1 covers the boundary first-frame latent).
-                workflow[WAN_FLF2V_FLF_NODE]["inputs"]["length"] = max(round(duration_s * fps), 1) + 1
-                seed = shot.get("seed")
-                workflow[WAN_FLF2V_SEED_NODE]["inputs"]["noise_seed"] = int(seed) if seed is not None else 0
-                workflow[WAN_FLF2V_VIDEO_NODE]["inputs"]["fps"] = fps
-
-                prompt_id = _comfy_submit(comfy_url, workflow)
-                outputs = _comfy_wait_for_result(comfy_url, prompt_id)
-                file_ref = _comfy_find_video_file(outputs)
+                submitted = _wan_video_submit(api_key, shot, start_path, end_path, width, height)
+                polling_url = submitted.get("polling_url") or f"{OPENROUTER_VIDEO_URL}/{submitted['id']}"
+                result = _wan_video_poll(api_key, polling_url)
             except Exception as exc:
                 print(f"[error] wan_flf render call failed for shot #{i}: {exc}")
                 raise
 
             clip_path = tmp_dir / f"shot_{i:03d}.mp4"
-            _comfy_download(comfy_url, file_ref, clip_path)
+            _wan_video_download(api_key, result, clip_path)
             clips.append(clip_path)
 
         _concat_shots(clips, spec, story_reel_dir, out_path)

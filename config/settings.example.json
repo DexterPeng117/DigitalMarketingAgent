@@ -10,8 +10,7 @@
   },
 
   "render": {
-    "default_animate_backend": "interp",
-    "comfy_url": "http://127.0.0.1:8188"
+    "default_animate_backend": "interp"
   },
 
   "tts": {
