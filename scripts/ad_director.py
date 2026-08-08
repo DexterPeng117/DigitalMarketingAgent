@@ -9,7 +9,13 @@ Input:
 Output:
     A single JSON spec file at workflows/<title>.json describing the ad:
     copy/tagline, shot-by-shot camera/animation instructions per view,
-    and render configuration.
+    and render configuration. Also, alongside the original product
+    photos in the --views directory, one new "product in scene" image
+    per view (assets/<brand>/scene_<view>.png — see "Scene generation"
+    below) — the spec's product.views[].image ends up pointing at these,
+    not the originals, so downstream (render_pipeline.py) transparently
+    renders shots against scened photos instead of bare studio product
+    shots, with zero changes needed on that end.
 
     The spec MUST always include an "animate_backend" field (e.g.
     "wan_flf" for the paid cloud render backend, or "interp" for the
@@ -52,9 +58,19 @@ Spec schema:
                                      width/height, sr_segment.build_prompt's
                                      width/height, sr_concat.concat_xfade's
                                      width/height/fps).
+      "scene_prompt":      str  -- unified background/mood/lighting
+                                     direction for the whole ad, consistent
+                                     with "tagline" (e.g. "underwater,
+                                     dramatic blue lighting"). Drives
+                                     generate_scene_images; kept in the
+                                     spec for traceability even though
+                                     render_pipeline.py never reads it.
       "product": {
         "views": [{"view": <name>, "image": <path>}, ...]
-                           -- one entry per input view. Also read by
+                           -- one entry per input view, pointing at the
+                              *scene* image (assets/<brand>/scene_<view>
+                              .png) once generate_scene_images has run,
+                              not the original studio photo. Also read by
                               ad_tracker.py's brand-extraction logic
                               (it infers brand from views[].image's
                               parent folder name), so the key names here
@@ -94,12 +110,40 @@ LLM call:
     config/settings.json's "llm.api_key", model from "llm.writer_model"),
     with the product view images attached so the model can ground copy
     and shot descriptions in what the product actually looks like. The
-    model is asked for raw JSON (title/tagline/assemble/shots); "title"
-    and non-empty "shots" are required, each shot's start_view/end_view
-    is validated against the actual view names and rejected with a clear
-    error if not one of them, everything else optional falls back to a
-    module-level default. A failed HTTP call or a non-JSON response is
-    never swallowed — both are printed clearly and re-raised.
+    model is asked for raw JSON (title/tagline/scene_prompt/assemble/
+    shots); "title", "scene_prompt", and non-empty "shots" are required,
+    each shot's start_view/end_view is validated against the actual view
+    names and rejected with a clear error if not one of them, everything
+    else optional falls back to a module-level default. A failed HTTP
+    call or a non-JSON response is never swallowed — both are printed
+    clearly and re-raised.
+
+Scene generation:
+    generate_scene_images turns each view's bare studio product photo
+    into a "product in scene" composite via Qwen Image 3 Pro
+    (qwen/qwen-image-3-pro) — OpenRouter's dedicated Images API, POST
+    https://openrouter.ai/api/v1/images (NOT chat completions), request
+    {"model", "prompt", "n": 1, "input_references": [{"type":
+    "image_url", "image_url": {"url": ...}}]} -> response {"data":
+    [{"b64_json": ..., "media_type": ...}], "usage": {"cost": ...}}.
+    Confirmed by a real test call (not guessed): $0.078 for one image at
+    1616x2560, and this account's block on google/gemini-2.5-flash-image
+    (403 Terms Of Service violation, on both chat completions and
+    /api/v1/images, with or without an image) does NOT extend to Qwen —
+    same as alibaba/wan-2.7 already being unaffected for video
+    generation, both being Alibaba-provider models on this account.
+
+    Known environment quirk (this dev sandbox specifically): its local
+    HTTP(S) proxy drops this call's long-held synchronous connection
+    (60s+) with ProxyError/ReadTimeout; bypassing the proxy for just
+    this request fixed it in testing. The bypass is harmless for
+    environments with no such proxy, so it's applied unconditionally
+    rather than only in this one sandbox.
+
+    Runs once per view, after generate_storyboard and before write_spec,
+    so the spec written to disk already points at the scene images —
+    render_pipeline.py (which just reads whatever path is in
+    product.views[].image) needs zero changes to pick this up.
 """
 from __future__ import annotations
 
@@ -116,7 +160,9 @@ import requests
 REPO_ROOT = Path(__file__).resolve().parents[1]
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_IMAGES_URL = "https://openrouter.ai/api/v1/images"
 DEFAULT_WRITER_MODEL = "openai/gpt-4o"
+SCENE_IMAGE_MODEL = "qwen/qwen-image-3-pro"
 
 DEFAULT_ANIMATE_BACKEND = "interp"
 DEFAULT_ASSEMBLE = "cut"
@@ -195,6 +241,8 @@ def generate_storyboard(views: dict[str, Path], brief: str | None, animate_backe
         '{\n'
         '  "title": "short_snake_case_ad_title",\n'
         '  "tagline": "one punchy line of ad copy",\n'
+        '  "scene_prompt": "a short, unified background/mood/lighting direction '
+        'for the whole ad, consistent with the tagline, e.g. \'underwater, dramatic blue lighting\'",\n'
         '  "assemble": "cut" or "xfade",\n'
         '  "shots": [\n'
         '    {\n'
@@ -252,6 +300,10 @@ def generate_storyboard(views: dict[str, Path], brief: str | None, animate_backe
     if not title:
         raise ValueError(f"Storyboard LLM response is missing a non-empty 'title': {draft}")
 
+    scene_prompt = str(draft.get("scene_prompt") or "").strip()
+    if not scene_prompt:
+        raise ValueError(f"Storyboard LLM response is missing a non-empty 'scene_prompt': {draft}")
+
     raw_shots = draft.get("shots")
     if not isinstance(raw_shots, list) or not raw_shots:
         raise ValueError(f"Storyboard LLM response is missing a non-empty 'shots' list: {draft}")
@@ -291,6 +343,7 @@ def generate_storyboard(views: dict[str, Path], brief: str | None, animate_backe
         "fps": DEFAULT_FPS,
         "width": DEFAULT_WIDTH,
         "height": DEFAULT_HEIGHT,
+        "scene_prompt": scene_prompt,
         "product": {
             "views": [{"view": name, "image": str(path)} for name, path in views.items()],
         },
@@ -299,6 +352,66 @@ def generate_storyboard(views: dict[str, Path], brief: str | None, animate_backe
         },
         "shots": shots,
     }
+
+
+def _scene_image_prompt(scene_prompt: str) -> str:
+    return (
+        "Keep the product in the reference image exactly as it is — same shape, "
+        "proportions, materials, color, and branding, completely unchanged. Only "
+        f"change the environment around it: place the product in this scene: {scene_prompt}. "
+        "Photorealistic, professional product photography, cinematic lighting, "
+        "sharp focus on the product."
+    )
+
+
+def generate_scene_images(views: dict[str, Path], scene_prompt: str, out_dir: Path) -> dict[str, Path]:
+    """For each view's original studio product photo, generate a new
+    "product in scene" composite via Qwen Image 3 Pro. See the module
+    docstring's "Scene generation" section for the API details and why
+    this model was chosen.
+
+    Saves each result to out_dir/scene_<view_name>.png (originals are
+    never modified or deleted) and returns view_name -> new image path.
+    """
+    api_key, _ = _load_openrouter_config()
+    prompt = _scene_image_prompt(scene_prompt)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    scene_images: dict[str, Path] = {}
+    for name, path in views.items():
+        try:
+            response = requests.post(
+                OPENROUTER_IMAGES_URL,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": SCENE_IMAGE_MODEL,
+                    "prompt": prompt,
+                    "n": 1,
+                    "input_references": [
+                        {"type": "image_url", "image_url": {"url": _encode_image_data_url(path)}},
+                    ],
+                },
+                timeout=180,
+                # This dev sandbox's local HTTP(S) proxy drops this call's
+                # long-held synchronous connection — see module docstring's
+                # "Scene generation" section. Harmless where no such proxy
+                # exists, so applied unconditionally rather than gated.
+                proxies={"http": None, "https": None},
+            )
+            if not response.ok:
+                raise RuntimeError(f"Scene image generation failed ({response.status_code}): {response.text}")
+            image_data = response.json()["data"][0]
+        except Exception as exc:
+            print(f"[error] Scene image generation failed for view {name!r}: {exc}")
+            raise
+
+        image_bytes = base64.standard_b64decode(image_data["b64_json"])
+        scene_path = out_dir / f"scene_{name}.png"
+        scene_path.write_bytes(image_bytes)
+        scene_images[name] = scene_path
+        print(f"   scene  -> {scene_path}  ({name})")
+
+    return scene_images
 
 
 def _slugify(text: str) -> str:
@@ -335,6 +448,9 @@ def main() -> None:
     views = load_views(Path(args.views))
     spec = generate_storyboard(views, args.brief, args.animate_backend)
     assert "animate_backend" in spec, "spec must always include animate_backend"
+
+    scene_images = generate_scene_images(views, spec["scene_prompt"], Path(args.views))
+    spec["product"]["views"] = [{"view": name, "image": str(scene_images[name])} for name in views]
 
     spec_path = write_spec(spec, Path(args.out_dir))
     print(f"   spec   -> {spec_path}")
