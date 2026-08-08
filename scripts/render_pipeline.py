@@ -78,6 +78,9 @@ OPENROUTER_VIDEO_URL = "https://openrouter.ai/api/v1/videos"
 DEFAULT_WAN_VIDEO_MODEL = "alibaba/wan-2.7"
 WAN_VIDEO_POLL_INTERVAL_S = 20
 WAN_VIDEO_POLL_TIMEOUT_S = 900
+# Short per-request connect/read timeout for each poll attempt, instead of
+# one long-held request — see _wan_video_poll's docstring.
+WAN_VIDEO_POLL_REQUEST_TIMEOUT_S = 10
 
 
 def load_spec(spec_path: Path) -> dict:
@@ -270,14 +273,52 @@ def _wan_video_submit(api_key: str, shot: dict, start_path: Path, end_path: Path
     return response.json()
 
 
+def _wan_video_job_log_path(out_path: Path) -> Path:
+    return out_path.parent / f"{out_path.stem}_jobs.jsonl"
+
+
+def _record_wan_video_job(out_path: Path, index: int, submitted: dict) -> None:
+    """Append this shot's job id/polling_url to a durable log next to
+    out_path, written immediately after submit succeeds — before polling
+    even starts. Verified against a real incident: a job can finish and
+    get billed server-side while the polling loop itself hangs, and
+    without this, the job id needed to recover it is gone the moment the
+    process exits."""
+    record = {"shot": index, "id": submitted.get("id"), "polling_url": submitted.get("polling_url")}
+    with _wan_video_job_log_path(out_path).open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+
 def _wan_video_poll(api_key: str, polling_url: str) -> dict:
     """Poll until the job reaches a terminal state, bounded by
-    WAN_VIDEO_POLL_TIMEOUT_S so this can never hang indefinitely."""
+    WAN_VIDEO_POLL_TIMEOUT_S so this can never hang indefinitely.
+
+    Each individual poll request uses a short
+    WAN_VIDEO_POLL_REQUEST_TIMEOUT_S connect/read timeout instead of one
+    long-held request. Verified against a real incident: this dev
+    sandbox's local proxy hung indefinitely on long-lived connections to
+    this endpoint (not just the single-shot /api/v1/images call — the
+    repeated short GET here too), with no exception ever raised to make
+    WAN_VIDEO_POLL_TIMEOUT_S's deadline check kick in. A short per-request
+    timeout means a stuck connection just means "not ready yet, retry
+    shortly" — sidesteps the failure mode by design rather than diagnosing
+    exactly what the proxy does wrong, which still isn't fully understood.
+    """
     deadline = time.monotonic() + WAN_VIDEO_POLL_TIMEOUT_S
     while time.monotonic() < deadline:
-        response = requests.get(polling_url, headers={"Authorization": f"Bearer {api_key}"}, timeout=30)
-        response.raise_for_status()
-        data = response.json()
+        try:
+            response = requests.get(
+                polling_url,
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=(WAN_VIDEO_POLL_REQUEST_TIMEOUT_S, WAN_VIDEO_POLL_REQUEST_TIMEOUT_S),
+            )
+            response.raise_for_status()
+            data = response.json()
+        except requests.exceptions.RequestException as exc:
+            print(f"[warn] poll request to {polling_url} failed ({exc}); retrying in {WAN_VIDEO_POLL_INTERVAL_S}s")
+            time.sleep(WAN_VIDEO_POLL_INTERVAL_S)
+            continue
+
         status = data.get("status")
         if status == "completed":
             return data
@@ -344,7 +385,12 @@ def render_wan_flf(spec: dict, story_reel_dir: Path, out_path: Path) -> Path:
 
     Polling is bounded by WAN_VIDEO_POLL_TIMEOUT_S (15 min) so a stuck
     job can't hang the pipeline forever; a missing/empty llm.api_key
-    raises immediately, before any shot is touched.
+    raises immediately, before any shot is touched. Each shot's job id
+    is written to outputs/<title>_silent_jobs.jsonl right after submit
+    succeeds, before polling even starts — see _record_wan_video_job and
+    _wan_video_poll's docstrings for why (a real incident: a job
+    completing and getting billed server-side while this process's own
+    polling hangs, with no other way to recover the id afterward).
     """
     api_key = _load_openrouter_api_key()
 
@@ -367,6 +413,7 @@ def render_wan_flf(spec: dict, story_reel_dir: Path, out_path: Path) -> Path:
             start_path, end_path = _shot_view_paths(shot, view_images, i)
             try:
                 submitted = _wan_video_submit(api_key, shot, start_path, end_path, width, height)
+                _record_wan_video_job(out_path, i, submitted)
                 polling_url = submitted.get("polling_url") or f"{OPENROUTER_VIDEO_URL}/{submitted['id']}"
                 result = _wan_video_poll(api_key, polling_url)
             except Exception as exc:
