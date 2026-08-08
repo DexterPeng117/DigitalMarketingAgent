@@ -31,6 +31,13 @@ Backend selection:
                     docstring. Same OpenRouter account/key already used
                     by extract_product_views.py and ad_director.py; no
                     GPU, no ComfyUI, no separate account.
+      - "wan_flf_local" — the same Wan 2.2 FLF2V model, run instead
+                    through a locally-running ComfyUI instance — see
+                    render_wan_flf_local's docstring. Independent of
+                    "wan_flf": no OpenRouter call, no per-second cost,
+                    just local/rented GPU time; needs config/settings
+                    .json's render.comfy_url reachable and the Wan 2.2
+                    model files installed.
 
     Per-shot clips are then concatenated according to spec["assemble"]:
       - "cut"   — straight concatenation (ffmpeg concat demuxer).
@@ -52,6 +59,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 import requests
@@ -374,8 +382,235 @@ def render_wan_flf(spec: dict, story_reel_dir: Path, out_path: Path) -> Path:
     return out_path
 
 
+COMFY_LOCAL_WORKFLOW_PATH = REPO_ROOT / "lib" / "story_reel" / "comfy_workflows" / "wan_flf2v.json"
+# Node ids inside that JSON that render_wan_flf_local patches per shot —
+# independent of render_wan_flf's own OPENROUTER_VIDEO_URL/_wan_video_*
+# constants and helpers above, on purpose: this is a separate backend.
+COMFY_LOCAL_POSITIVE_NODE = "6"
+COMFY_LOCAL_NEGATIVE_NODE = "7"
+COMFY_LOCAL_START_IMAGE_NODE = "68"
+COMFY_LOCAL_END_IMAGE_NODE = "62"
+COMFY_LOCAL_FLF_NODE = "67"
+COMFY_LOCAL_SEED_NODE = "57"
+COMFY_LOCAL_VIDEO_NODE = "60"
+
+COMFY_LOCAL_HEALTHCHECK_TIMEOUT_S = 5
+COMFY_LOCAL_SUBMIT_TIMEOUT_S = 30
+COMFY_LOCAL_POLL_INTERVAL_S = 5
+COMFY_LOCAL_POLL_TIMEOUT_S = 900
+
+
+def _comfy_local_url() -> str:
+    settings_path = REPO_ROOT / "config" / "settings.json"
+    if not settings_path.exists():
+        raise RuntimeError(
+            "config/settings.json not found. Copy config/settings.example.json "
+            "to config/settings.json (render.comfy_url defaults to http://127.0.0.1:8188)."
+        )
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    comfy_url = settings.get("render", {}).get("comfy_url")
+    if not comfy_url:
+        raise RuntimeError("config/settings.json is missing a non-empty 'render.comfy_url'.")
+    return comfy_url.rstrip("/")
+
+
+def _check_comfy_local_reachable(comfy_url: str) -> None:
+    """Fail fast (bounded by COMFY_LOCAL_HEALTHCHECK_TIMEOUT_S) instead of
+    hanging on ComfyUI's default request timeout if it's offline."""
+    try:
+        response = requests.get(f"{comfy_url}/system_stats", timeout=COMFY_LOCAL_HEALTHCHECK_TIMEOUT_S)
+        response.raise_for_status()
+    except Exception as exc:
+        raise RuntimeError(
+            f"ComfyUI not reachable at {comfy_url}; make sure it's running locally "
+            f"with the Wan 2.2 models installed."
+        ) from exc
+
+
+def _comfy_local_upload_image(comfy_url: str, path: Path) -> str:
+    with path.open("rb") as f:
+        response = requests.post(
+            f"{comfy_url}/upload/image",
+            files={"image": (path.name, f, "image/png")},
+            data={"type": "input", "overwrite": "true"},
+            timeout=60,
+        )
+    response.raise_for_status()
+    return response.json()["name"]
+
+
+def _comfy_local_submit(comfy_url: str, workflow: dict) -> str:
+    response = requests.post(
+        f"{comfy_url}/prompt",
+        json={"prompt": workflow, "client_id": str(uuid.uuid4())},
+        timeout=COMFY_LOCAL_SUBMIT_TIMEOUT_S,
+    )
+    response.raise_for_status()
+    return response.json()["prompt_id"]
+
+
+def _comfy_local_wait_for_result(comfy_url: str, prompt_id: str) -> dict:
+    """Poll /history/{prompt_id} until ComfyUI reports this prompt done,
+    then return its "outputs" dict.
+
+    Known caveat (unverified here, flagging for whoever runs this for
+    real): ComfyUI's /history reporting for SaveVideo specifically has
+    had reliability issues in some versions — a render can finish and
+    the file can exist in ComfyUI's output/ folder while /history never
+    shows it. If this raises TimeoutError despite ComfyUI's own
+    console/log clearly showing the prompt finished, check its output
+    folder directly before assuming the call itself is broken.
+    """
+    deadline = time.monotonic() + COMFY_LOCAL_POLL_TIMEOUT_S
+    while time.monotonic() < deadline:
+        response = requests.get(f"{comfy_url}/history/{prompt_id}", timeout=30)
+        response.raise_for_status()
+        history = response.json()
+        entry = history.get(prompt_id)
+        if entry is not None:
+            status = entry.get("status", {})
+            if status.get("status_str") == "error":
+                raise RuntimeError(f"ComfyUI reported an error for prompt {prompt_id}: {status}")
+            if status.get("completed") or status.get("status_str") == "success":
+                return entry.get("outputs", {})
+        time.sleep(COMFY_LOCAL_POLL_INTERVAL_S)
+    raise TimeoutError(f"Timed out after {COMFY_LOCAL_POLL_TIMEOUT_S}s waiting for ComfyUI prompt {prompt_id}")
+
+
+def _comfy_local_find_video_file(outputs: dict) -> dict:
+    """outputs is node_id -> {field_name: value, ...}; scan every
+    list-valued field for a dict with a "filename" key, since the exact
+    field name SaveVideo's output lands under has moved between ComfyUI
+    versions (images/gifs/videos) — see _comfy_local_wait_for_result's
+    caveat.
+    """
+    for node_output in outputs.values():
+        for value in node_output.values():
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict) and "filename" in item:
+                        return item
+    raise RuntimeError(f"No output file found in ComfyUI history outputs: {outputs}")
+
+
+def _comfy_local_download(comfy_url: str, file_ref: dict, out_path: Path) -> None:
+    params = {
+        "filename": file_ref["filename"],
+        "subfolder": file_ref.get("subfolder", ""),
+        "type": file_ref.get("type", "output"),
+    }
+    response = requests.get(f"{comfy_url}/view", params=params, timeout=120)
+    response.raise_for_status()
+    out_path.write_bytes(response.content)
+
+
+def render_wan_flf_local(spec: dict, story_reel_dir: Path, out_path: Path) -> Path:
+    """Render all shots using Wan 2.2 FLF2V (first-last-frame-to-video)
+    through a locally-running ComfyUI instance — Apache-2.0, Alibaba,
+    commercially usable, no paid API; cost is just local/rented GPU time.
+
+    Independent of render_wan_flf (the OpenRouter cloud path — verified
+    working: a real front->back generation cost $0.50 for a 2s clip).
+    This is a separate backend for when local/rented GPU capacity is
+    available instead, selected via spec["animate_backend"] ==
+    "wan_flf_local". Shares no code with render_wan_flf beyond the
+    generic, backend-agnostic helpers (_view_images, _shot_view_paths,
+    _concat_shots) every backend already uses.
+
+    Drives lib/story_reel/comfy_workflows/wan_flf2v.json, the API-format
+    node graph for the 4-step LoRA-accelerated variant of the official
+    Comfy-Org "video_wan2_2_14B_flf2v" template (~70-110s/shot on an
+    RTX 4090-class GPU, vs 500s+ without the LoRA). Every node in it is
+    comfy-core (no custom node packs); requires these model files under
+    ComfyUI/models/:
+      diffusion_models/  wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors
+                          wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors
+      loras/              wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors
+                          wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors
+      text_encoders/      umt5_xxl_fp8_e4m3fn_scaled.safetensors
+      vae/                wan_2.1_vae.safetensors
+    (all from huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged, per
+    docs.comfy.org/tutorials/video/wan/wan2_2).
+
+    Per shot: uploads the start/end view images to ComfyUI (/upload/image),
+    patches a copy of the workflow template with this shot's prompt/
+    negative_prompt/width/height/length/seed, submits it (/prompt), polls
+    for completion (/history), and downloads the resulting clip (/view).
+
+    Fails fast with a clear error if ComfyUI isn't reachable at
+    config/settings.json's render.comfy_url — checked once up front via
+    /system_stats, bounded by COMFY_LOCAL_HEALTHCHECK_TIMEOUT_S — rather
+    than hanging on a connection timeout or failing partway through a shot.
+
+    Not verified end-to-end in this environment: no GPU/ComfyUI/model
+    weights available here. What IS verified: the workflow JSON's node
+    graph matches the official template's wiring exactly (programmatic
+    edge/class_type diff against the traced source, 23/23 edges), and
+    that this addition doesn't affect render_interp's or render_wan_flf's
+    existing behavior (regression-checked).
+    """
+    comfy_url = _comfy_local_url()
+    _check_comfy_local_reachable(comfy_url)
+
+    fps = int(spec.get("fps", DEFAULT_FPS))
+    width = int(spec.get("width", DEFAULT_WIDTH))
+    height = int(spec.get("height", DEFAULT_HEIGHT))
+    shots = spec.get("shots")
+    if not shots:
+        raise ValueError("spec has no shots to render")
+    view_images = _view_images(spec)
+    if not view_images:
+        raise ValueError("spec has no product.views to render from")
+
+    template = json.loads(COMFY_LOCAL_WORKFLOW_PATH.read_text(encoding="utf-8"))
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="render_wan_flf_local_") as tmp:
+        tmp_dir = Path(tmp)
+        clips = []
+        for i, shot in enumerate(shots):
+            start_path, end_path = _shot_view_paths(shot, view_images, i)
+            try:
+                start_name = _comfy_local_upload_image(comfy_url, start_path)
+                end_name = _comfy_local_upload_image(comfy_url, end_path)
+
+                workflow = json.loads(json.dumps(template))  # deep copy
+                workflow[COMFY_LOCAL_START_IMAGE_NODE]["inputs"]["image"] = start_name
+                workflow[COMFY_LOCAL_END_IMAGE_NODE]["inputs"]["image"] = end_name
+                workflow[COMFY_LOCAL_POSITIVE_NODE]["inputs"]["text"] = shot.get("prompt", "")
+                workflow[COMFY_LOCAL_NEGATIVE_NODE]["inputs"]["text"] = shot.get("negative_prompt", "")
+                workflow[COMFY_LOCAL_FLF_NODE]["inputs"]["width"] = width
+                workflow[COMFY_LOCAL_FLF_NODE]["inputs"]["height"] = height
+                duration_s = float(shot.get("duration_s") or DEFAULT_SHOT_DURATION_S)
+                # WanFirstLastFrameToVideo's "length" is output frame count + 1
+                # (see the official template: length=81 @ fps=16 -> 80 output
+                # frames -> 5s; the +1 covers the boundary first-frame latent).
+                workflow[COMFY_LOCAL_FLF_NODE]["inputs"]["length"] = max(round(duration_s * fps), 1) + 1
+                seed = shot.get("seed")
+                workflow[COMFY_LOCAL_SEED_NODE]["inputs"]["noise_seed"] = int(seed) if seed is not None else 0
+                workflow[COMFY_LOCAL_VIDEO_NODE]["inputs"]["fps"] = fps
+
+                prompt_id = _comfy_local_submit(comfy_url, workflow)
+                outputs = _comfy_local_wait_for_result(comfy_url, prompt_id)
+                file_ref = _comfy_local_find_video_file(outputs)
+            except Exception as exc:
+                print(f"[error] wan_flf_local render call failed for shot #{i}: {exc}")
+                raise
+
+            clip_path = tmp_dir / f"shot_{i:03d}.mp4"
+            _comfy_local_download(comfy_url, file_ref, clip_path)
+            clips.append(clip_path)
+
+        _concat_shots(clips, spec, story_reel_dir, out_path)
+
+    return out_path
+
+
 BACKENDS = {
     "wan_flf": render_wan_flf,
+    "wan_flf_local": render_wan_flf_local,
     "interp": render_interp,
 }
 
