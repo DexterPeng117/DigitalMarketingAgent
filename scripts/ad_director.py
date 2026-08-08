@@ -77,8 +77,16 @@ Spec schema:
                               ("view"/"image") must not change.
       },
       "audio": {
-        "tagline": str    -- short ad-copy line (read by finalize_ad.py
-                              and by ad_tracker.py's brand fallback).
+        "tagline": str    -- short ad-copy line (kept for ad_tracker.py's
+                              brand fallback / on-screen use).
+        "narration_script": str
+                           -- longer voiceover script (multiple
+                              sentences), meant to be read aloud over
+                              roughly the whole ad rather than just a
+                              few seconds of it. finalize_ad.py's
+                              synthesize_narration/build_subtitles read
+                              this (falling back to "tagline" for older
+                              specs that predate this field).
       },
       "shots": [
         {
@@ -110,13 +118,24 @@ LLM call:
     config/settings.json's "llm.api_key", model from "llm.writer_model"),
     with the product view images attached so the model can ground copy
     and shot descriptions in what the product actually looks like. The
-    model is asked for raw JSON (title/tagline/scene_prompt/assemble/
-    shots); "title", "scene_prompt", and non-empty "shots" are required,
-    each shot's start_view/end_view is validated against the actual view
-    names and rejected with a clear error if not one of them, everything
-    else optional falls back to a module-level default. A failed HTTP
-    call or a non-JSON response is never swallowed — both are printed
-    clearly and re-raised.
+    model is asked for raw JSON (title/tagline/narration_script/
+    scene_prompt/assemble/shots); "title", "narration_script",
+    "scene_prompt", and non-empty "shots" are required, each shot's
+    start_view/end_view is validated against the actual view names and
+    rejected with a clear error if not one of them, everything else
+    optional falls back to a module-level default. A failed HTTP call or
+    a non-JSON response is never swallowed — both are printed clearly
+    and re-raised.
+
+    narration_script isn't given an exact target length: the total shot
+    duration isn't known until the same response's "shots" are parsed,
+    so there's no duration figure to hand the model up front without a
+    second LLM call. Instead it's just asked for a handful of sentences
+    "meant to be read aloud over the course of the whole ad" — natural
+    TTS pacing then roughly fills the video instead of a single short
+    tagline leaving most of it silent (the original problem this fixes).
+    finalize_ad.py's mix_and_mux already trims/pads for the mismatch
+    either way, so an imperfect length match here isn't fatal.
 
 Scene generation:
     generate_scene_images turns each view's bare studio product photo
@@ -241,6 +260,9 @@ def generate_storyboard(views: dict[str, Path], brief: str | None, animate_backe
         '{\n'
         '  "title": "short_snake_case_ad_title",\n'
         '  "tagline": "one punchy line of ad copy",\n'
+        '  "narration_script": "3 to 5 sentences of voiceover copy, meant to be read '
+        'aloud over the course of the whole ad (not just the tagline repeated) — '
+        'descriptive, cinematic language expanding on the tagline and matching the scene_prompt mood",\n'
         '  "scene_prompt": "a short, unified background/mood/lighting direction '
         'for the whole ad, consistent with the tagline, e.g. \'underwater, dramatic blue lighting\'",\n'
         '  "assemble": "cut" or "xfade",\n'
@@ -304,6 +326,10 @@ def generate_storyboard(views: dict[str, Path], brief: str | None, animate_backe
     if not scene_prompt:
         raise ValueError(f"Storyboard LLM response is missing a non-empty 'scene_prompt': {draft}")
 
+    narration_script = str(draft.get("narration_script") or "").strip()
+    if not narration_script:
+        raise ValueError(f"Storyboard LLM response is missing a non-empty 'narration_script': {draft}")
+
     raw_shots = draft.get("shots")
     if not isinstance(raw_shots, list) or not raw_shots:
         raise ValueError(f"Storyboard LLM response is missing a non-empty 'shots' list: {draft}")
@@ -349,6 +375,7 @@ def generate_storyboard(views: dict[str, Path], brief: str | None, animate_backe
         },
         "audio": {
             "tagline": str(draft.get("tagline") or ""),
+            "narration_script": narration_script,
         },
         "shots": shots,
     }

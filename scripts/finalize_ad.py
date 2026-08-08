@@ -32,11 +32,14 @@ TTS:
     entirely when unset, rather than guessing a voice name.
 
 Subtitles:
-    A single .srt cue spanning the narration's full duration, holding
-    spec["audio"]["tagline"] verbatim. The spec only carries one line of
-    ad copy, not a multi-sentence script with per-segment timing, so one
-    full-duration cue is the honest match for the data actually
-    available.
+    One .srt cue per sentence of spec["audio"]["narration_script"]
+    (falling back to "tagline" for older specs from before that field
+    existed), evenly distributed across the narration's full duration —
+    not driven by real per-word TTS timestamps (the TTS response is raw
+    audio bytes, no timing metadata), so this is an even split by
+    sentence count rather than true audio-aligned timing. Cheap and
+    honest given the data actually available; revisit if word-level
+    timestamps ever become available from the TTS provider.
 
     Soft-mounted (MP4 mov_text track) rather than burned into the
     picture: burn-in needs ffmpeg built with libass (the `subtitles`
@@ -62,6 +65,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -111,17 +115,24 @@ def _load_tts_config() -> tuple[str, str, str, str]:
     return api_key, model, voice, response_format
 
 
+def _narration_text(spec: dict) -> str:
+    audio = spec.get("audio", {})
+    text = str(audio.get("narration_script") or audio.get("tagline") or "").strip()
+    if not text:
+        raise ValueError("spec['audio'] has neither a non-empty 'narration_script' nor 'tagline'; nothing to narrate")
+    return text
+
+
 def synthesize_narration(spec: dict, out_dir: Path) -> Path:
-    """Generate a narration audio track from spec["audio"]["tagline"] via
-    OpenRouter's TTS endpoint. Returns the path to the generated audio file.
+    """Generate a narration audio track from spec["audio"]["narration_script"]
+    (falling back to "tagline" for older specs) via OpenRouter's TTS
+    endpoint. Returns the path to the generated audio file.
     """
-    tagline = spec.get("audio", {}).get("tagline", "").strip()
-    if not tagline:
-        raise ValueError("spec['audio']['tagline'] is empty; nothing to narrate")
+    text = _narration_text(spec)
 
     api_key, model, voice, response_format = _load_tts_config()
 
-    payload = {"model": model, "input": tagline, "response_format": response_format}
+    payload = {"model": model, "input": text, "response_format": response_format}
     if voice:
         payload["voice"] = voice
 
@@ -152,20 +163,35 @@ def _srt_timestamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
 
 
+def _split_sentences(text: str) -> list[str]:
+    """Naive sentence splitter: break after '.', '!', or '?' followed by
+    whitespace. No NLP — good enough for the short narration scripts this
+    generates, and a wrong split just means a slightly off cue boundary,
+    not broken output."""
+    parts = re.split(r"(?<=[.!?])\s+", text.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
 def build_subtitles(spec: dict, narration_path: Path, out_dir: Path) -> Path:
-    """Write a single-cue .srt spanning the narration's full duration,
-    holding spec["audio"]["tagline"] verbatim (see module docstring's
-    "Subtitles" section for why one full-duration cue).
+    """Write one .srt cue per sentence of the narration text, evenly
+    distributed across the narration's full duration (see module
+    docstring's "Subtitles" section for why this is an even split
+    rather than true audio-aligned timing).
     """
-    tagline = spec.get("audio", {}).get("tagline", "").strip()
+    text = _narration_text(spec)
     duration_s = _ffprobe_duration(narration_path)
+    sentences = _split_sentences(text) or [text]
+    per_cue = duration_s / len(sentences)
+
+    cues = []
+    for i, sentence in enumerate(sentences):
+        start = i * per_cue
+        end = duration_s if i == len(sentences) - 1 else (i + 1) * per_cue
+        cues.append(f"{i + 1}\n{_srt_timestamp(start)} --> {_srt_timestamp(end)}\n{sentence}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     srt_path = out_dir / "subtitles.srt"
-    srt_path.write_text(
-        f"1\n{_srt_timestamp(0)} --> {_srt_timestamp(duration_s)}\n{tagline}\n",
-        encoding="utf-8",
-    )
+    srt_path.write_text("\n\n".join(cues) + "\n", encoding="utf-8")
     return srt_path
 
 
