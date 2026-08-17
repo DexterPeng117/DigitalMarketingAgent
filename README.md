@@ -55,10 +55,23 @@ Run everything end-to-end:
 
 ## Current status
 
-The four core scripts currently only have function signatures + docstrings +
-`TODO`s (`NotImplementedError`) — real implementations will be filled in once
-the design direction is confirmed. `ad_tracker.py`, `lib/story_reel/*`, and
-`scripts/run_full_pipeline.sh` are already complete and usable as-is.
+All five pipeline scripts are implemented and have been exercised against
+real product photos and real API calls:
+
+- `extract_product_views.py`, `ad_director.py` (including scene-image
+  generation), `render_pipeline.py` (`interp` / `wan_flf` / `wan_flf_local`
+  backends), and `finalize_ad.py` (narration, subtitles, mixing).
+- `ad_tracker.py`, `lib/story_reel/*`, and `scripts/run_full_pipeline.sh`
+  were already complete, carried over as-is.
+
+Known gaps:
+
+- `wan_flf_local` (local ComfyUI backend) is implemented but hasn't been
+  tested end-to-end — no GPU/ComfyUI environment has been available yet.
+- Automatic background-music generation isn't implemented: OpenRouter's
+  only music-generation models (Google Lyria 3) return a region
+  restriction on this account. `finalize_ad.py --music` still accepts a
+  manually supplied track.
 
 ## Setup
 
