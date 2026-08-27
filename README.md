@@ -8,6 +8,16 @@ without referencing or copying any existing codebase's source. `ad_tracker.py`,
 own pre-existing original files (the latter had its path references adjusted
 to fit this repo's layout).
 
+## Sample output
+
+| AI-generated scene composite (`ad_director.py`) | Frame from a finished ad (`render_pipeline.py` + `finalize_ad.py`) |
+| --- | --- |
+| ![Scene generation sample](docs/demo/sample_scene_generation.jpg) | ![Finished ad frame](docs/demo/sample_output.jpg) |
+
+Left: a product photo composited into a generated scene (Qwen Image 3 Pro).
+Right: a frame from the corresponding rendered ad, after Wan video
+generation, TTS narration, and subtitle muxing.
+
 ## Directory structure
 
 ```
