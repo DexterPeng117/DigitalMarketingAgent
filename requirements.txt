@@ -13,6 +13,9 @@ requests>=2.31
 
 # python-dotenv>=1.0     # load config/settings.json secrets into the environment (unused so far)
 
+# Test suite (tests/):
+pytest>=7.0
+
 # External (not pip-installable): ffmpeg/ffprobe must be on PATH for
 # render_pipeline.py (frame encoding, concat, xfade), finalize_ad.py
 # (concat/mux), and ad_tracker.py (duration probing via ffprobe).
